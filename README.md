@@ -1,6 +1,6 @@
 # CircS-ViT-Implementation
 Source code and datasets for "Topic- and Physics-guided Vision Transformer for PolSAR Land Cover Classification via Circular Polarization Features" in IEEE/CAA Journal of Automatica Sinica.
-
+https://github.com/zhangssy/CircS-ViT-implementation/blob/main/Flowchart/flowchart.png
 The paper will be published soon.
 # Datasets
 Three benchmark PolSAR datasets were utilized to assess the performance of the proposed method in this study.
