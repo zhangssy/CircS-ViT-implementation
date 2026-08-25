@@ -5,6 +5,7 @@ Source code and datasets for "Topic- and Physics-guided Vision Transformer for P
 The paper will be published soon.
 # Datasets
 Three benchmark PolSAR datasets were utilized to assess the performance of the proposed method in this study.
+![image](https://github.com/zhangssy/CircS-ViT-implementation/blob/main/Flowchart/1.png?raw=true)
 # Experimental Configuration
 Intel(R) Core(TM) i7-10700 CPU (2.90 GHz) and an NVIDIA GeForce 3060Ti GPU, utilizing PyTorch 3.8.
 
