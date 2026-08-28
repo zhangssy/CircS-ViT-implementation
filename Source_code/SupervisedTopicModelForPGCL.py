@@ -1,6 +1,10 @@
 """
-Supervised topic model (sLDA-style) for PGCL in CircS-ViT.
-Maps continuous features to simplex topic proportions and predicts class logits.
+Supervised topic model (sLDA-guided surrogate) for PGCL in CircS-ViT.
+
+Eq. (26):  theta = softmax(MLP_f2t(z)) in Delta^{K-1}
+Eq. (27):  hat{z} = Phi^T theta,  L_rec = ||hat{z} - z||_2^2
+Eq. (28):  L_topic = L_CE^top + lambda_rec L_rec
+           o_top = H^T theta
 """
 
 import torch
@@ -19,56 +23,61 @@ class SupervisedTopicModelForPGCL(nn.Module):
         self.num_classes = num_classes
         self.feature_depth = feature_depth
 
-        self.topic_basis = nn.Parameter(torch.randn(num_topics, embed_dim))
+        # Phi in R^{K x d}; hat{z} = Phi^T theta  <=>  theta @ Phi
+        self.topic_basis = nn.Parameter(torch.empty(num_topics, embed_dim))
         nn.init.xavier_uniform_(self.topic_basis)
-        with torch.no_grad():
-            self.topic_basis.data = torch.abs(self.topic_basis.data) + 0.1
 
-        if feature_depth == 3:
-            self.feature_to_topic = nn.Sequential(
-                nn.Linear(embed_dim, 128),
+        # MLP_f2t of depth D; last layer has no activation (softmax is applied after).
+        # Hidden width is of order d (2d), as in the complexity analysis.
+        hidden = 2 * embed_dim
+        if feature_depth == 1:
+            layers = [nn.Linear(embed_dim, num_topics)]
+        elif feature_depth == 2:
+            layers = [
+                nn.Linear(embed_dim, hidden),
                 nn.ReLU(),
-                nn.Linear(128, 128),
+                nn.Linear(hidden, num_topics),
+            ]
+        elif feature_depth == 3:
+            layers = [
+                nn.Linear(embed_dim, hidden),
                 nn.ReLU(),
-                nn.Linear(128, num_topics),
+                nn.Linear(hidden, hidden),
                 nn.ReLU(),
-            )
+                nn.Linear(hidden, num_topics),
+            ]
         elif feature_depth == 4:
-            self.feature_to_topic = nn.Sequential(
-                nn.Linear(embed_dim, 128),
+            layers = [
+                nn.Linear(embed_dim, hidden),
                 nn.ReLU(),
-                nn.Linear(128, 256),
+                nn.Linear(hidden, hidden),
                 nn.ReLU(),
-                nn.Linear(256, 128),
+                nn.Linear(hidden, hidden),
                 nn.ReLU(),
-                nn.Linear(128, num_topics),
-                nn.ReLU(),
-            )
+                nn.Linear(hidden, num_topics),
+            ]
         else:
-            raise ValueError(f"feature_depth must be 3 or 4, got {feature_depth}")
+            raise ValueError(f"feature_depth D of MLP_f2t must be 1--4, got {feature_depth}")
 
-        self.eta = nn.Parameter(torch.randn(num_topics, num_classes))
+        self.feature_to_topic = nn.Sequential(*layers)
+
+        # H in R^{K x N_c}; o_top = H^T theta  <=>  theta @ H
+        self.eta = nn.Parameter(torch.empty(num_topics, num_classes))
         nn.init.xavier_uniform_(self.eta)
 
     def forward(self, cls_features):
-        doc_topic = self.feature_to_topic(cls_features)
-        doc_topic = F.relu(doc_topic)
-        doc_topic = doc_topic / (doc_topic.sum(dim=1, keepdim=True) + 1e-10)
+        topic_logits = self.feature_to_topic(cls_features)
+        doc_topic = F.softmax(topic_logits, dim=1)
         reconstructed_features = torch.matmul(doc_topic, self.topic_basis)
         return doc_topic, reconstructed_features
 
-    def compute_supervised_loss(self, cls_features, labels):
+    def compute_supervised_loss(self, cls_features, labels, lambda_rec=0.1):
+        """L_CE^top + lambda_rec L_rec (Eqs. (23), (27), (28))."""
         doc_topic, reconstructed_features = self.forward(cls_features)
-        recon_loss = F.mse_loss(reconstructed_features, cls_features)
+        rec_loss = torch.sum((reconstructed_features - cls_features) ** 2, dim=1).mean()
         logits = torch.matmul(doc_topic, self.eta)
         ce_loss = F.cross_entropy(logits, labels)
-
-        topic_similarity = torch.matmul(self.topic_basis, self.topic_basis.t())
-        mask = torch.eye(self.num_topics, device=topic_similarity.device).bool()
-        topic_similarity = topic_similarity.masked_fill(mask, 0)
-        diversity_loss = torch.mean(torch.abs(topic_similarity))
-
-        return recon_loss + ce_loss + 0.01 * diversity_loss
+        return ce_loss + lambda_rec * rec_loss
 
     def get_topic_representation(self, cls_features):
         self.eval()
