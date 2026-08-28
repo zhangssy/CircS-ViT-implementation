@@ -19,15 +19,22 @@ from time import time
 
 from VisionTransformer_Cir import VisionTransformer as ViT_Cir
 from VisionTransformer_RSD import VisionTransformer as ViT_RSD
-from Train_Fusion import GuidedVisionTransformerCir
+from Train_Fusion import GuidedVisionTransformerCir, SCENE_SETTINGS
 
 begin_time = time()
 
 # ---------------------------------------------------------------------------
-# User-configurable paths and hyper-parameters (modify before running)
+# User-configurable paths and scene (modify before running)
+# SCENE: "barnaul" | "san_francisco" | "oberpfaffenhofen"
 # ---------------------------------------------------------------------------
 DATA_ROOT = "./data"
 MODEL_DIR = "./checkpoints"
+SCENE = "barnaul"
+
+if SCENE not in SCENE_SETTINGS:
+    raise ValueError(f"Unknown SCENE={SCENE!r}; choose one of {list(SCENE_SETTINGS)}")
+windowSize = SCENE_SETTINGS[SCENE]["patch_size"]
+num_classes = SCENE_SETTINGS[SCENE]["num_classes"]
 
 # Cir feature map and ground-truth .mat files (HDF5 v7.3 supported via h5py)
 test_data_path = os.path.join(DATA_ROOT, "Cir_Test_Span_Normalization.mat")
@@ -37,9 +44,7 @@ test_gt_path = os.path.join(DATA_ROOT, "ground_truth.mat")
 test_data_key = "Cir_features"   # Cir feature tensor in the .mat file
 test_gt_key = "cdata"            # ground-truth label map
 
-# Model architecture (Table V & Section IV-E; must match Train_Fusion.py)
-windowSize = 7          # 7x7 for Barnaul; use 11 for Oberpfaffenhofen / San Francisco
-num_classes = 9           # Barnaul has 9 classes
+# Model architecture (Tables III--VII; must match Train_Fusion.py)
 num_topics = 15           # K
 embed_dim = 64            # d
 num_heads = 4             # h
@@ -47,7 +52,7 @@ in_channels_rsd = 12      # RSD polarimetric feature channels
 in_channels_cir = 10      # Cir-domain real feature channels
 depth_rsd = 3             # L_RSD
 depth_cir = 4             # L_Cir
-mlp_feature_depth = 4       # D of MLP_f2t
+mlp_feature_depth = 4     # D of MLP_f2t
 token_patch_size = 1      # P
 
 
@@ -206,9 +211,9 @@ rsd_model.load_state_dict(rsd_state, strict=True)
 rsd_model.eval()
 
 if hasattr(rsd_model, 'use_dual_branch') and rsd_model.use_dual_branch:
-    print("Dual-branch RSD architecture detected; using fusion PGCL guidance modules.")
-    guidance_topic = copy.deepcopy(rsd_model.fusion_pgcl.branch2_topic_model).to(device).eval()
-    guidance_pgcl = copy.deepcopy(rsd_model.fusion_pgcl.branch2_pgcl).to(device).eval()
+    print("Dual-branch RSD architecture detected; using shared TopMod/PGCL.")
+    guidance_topic = copy.deepcopy(rsd_model.topic_model).to(device).eval()
+    guidance_pgcl = copy.deepcopy(rsd_model.pgcl).to(device).eval()
 else:
     print("Single-branch RSD architecture detected.")
     guidance_topic = copy.deepcopy(rsd_model.topic_model).to(device).eval()
@@ -230,7 +235,10 @@ base_model = ViT_Cir(
     depth=depth_cir,
     img_size=windowSize,
     patch_size=token_patch_size,
-    rsd_model_path=pgcl_model_path,
+    mlp_dim=128,
+    frozen_topic=guidance_topic,
+    frozen_pgcl=guidance_pgcl,
+    pgcl_hidden_dim=128,
 ).to(device)
 
 fusion_model = GuidedVisionTransformerCir(
