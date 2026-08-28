@@ -114,17 +114,7 @@ class VisionTransformer(nn.Module):
                 mlp_feature_depth=mlp_feature_depth,
             )
             
-            # 最终分类器
-            self.pgcl_classifier = nn.Sequential(
-                nn.LayerNorm(self.pgcl_hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.pgcl_hidden_dim, num_classes)
-            )
-            
-            # 为了兼容性，保留topic_model和pgcl作为融合PGCL的引用
-            # These references are kept for Cir-stage loading compatibility; fusion_pgcl is used at runtime
-            self.topic_model = self.fusion_pgcl.branch2_topic_model
-            self.pgcl = self.fusion_pgcl.branch2_pgcl
+            # L_CE^e head is DualBranchFusionPGCL.e_classifier (see pgcl_classifier property)
             
         elif use_pgcl:
             # 单分支模式（原始设计，保持向后兼容）
@@ -140,25 +130,23 @@ class VisionTransformer(nn.Module):
             ])
             self.norm = nn.LayerNorm(embed_dim)
             
-            self.topic_model = SupervisedTopicModelForPGCL(
+            self.add_module("topic_model", SupervisedTopicModelForPGCL(
                 embed_dim=embed_dim,
                 num_topics=num_topics,
                 num_classes=num_classes,
                 feature_depth=mlp_feature_depth,
-            )
-            
-            self.pgcl = PhysicsGuidedCouplingLayer(
+            ))
+            self.add_module("pgcl", PhysicsGuidedCouplingLayer(
                 embed_dim=embed_dim,
                 num_topics=num_topics,
                 num_classes=num_classes,
-                hidden_dim=self.pgcl_hidden_dim
-            )
-            
-            self.pgcl_classifier = nn.Sequential(
+                hidden_dim=self.pgcl_hidden_dim,
+            ))
+            self.add_module("pgcl_classifier", nn.Sequential(
                 nn.LayerNorm(self.pgcl_hidden_dim),
                 nn.GELU(),
-                nn.Linear(self.pgcl_hidden_dim, num_classes)
-            )
+                nn.Linear(self.pgcl_hidden_dim, num_classes),
+            ))
         else:
             # 不使用PGCL的原始模式
             self.patch_embed = PatchEmbedding(in_channels, embed_dim, img_size, patch_size)
@@ -203,19 +191,11 @@ class VisionTransformer(nn.Module):
             x_vit = self.norm(x_vit)
             cls_features = x_vit[:, 0]  # 取 [CLS] token (B, embed_dim)
             
-            # ========== 使用融合PGCL层处理 ==========
-            # 融合PGCL层内部包含：
-            # - 分支1：原始RSD数据直接与主题模型结合
-            # - 分支2：CLS特征与主题模型结合
-            # - 融合两个分支的增强特征
-            enhanced_features, branch1_topic, branch2_topic = self.fusion_pgcl(
-                cls_features, raw_data=x  # 传入原始RSD数据用于分支1
-            )  # (B, hidden_dim)
-            
-            # 最终分类
-            logits = self.pgcl_classifier(enhanced_features)  # (B, num_classes)
-            
-            # 返回结果（为了兼容性，返回分支2的cls和topic）
+            # Shared TopMod/PGCL (Algorithm 2): Branch 2 CLS path for evaluation logits
+            outputs = self.fusion_pgcl(cls_features, raw_data=x)
+            e2 = outputs[0]
+            branch2_topic = outputs[2]
+            logits = self.pgcl_classifier(e2)
             return logits, cls_features, branch2_topic
             
         elif self.use_pgcl:
@@ -296,3 +276,21 @@ class VisionTransformer(nn.Module):
         cls_features = self.extract_features(x)
         topic_representation = self.topic_model.get_topic_representation(cls_features)
         return topic_representation
+
+    @property
+    def topic_model(self):
+        if self.use_dual_branch and self.use_pgcl:
+            return self.fusion_pgcl.topic_model
+        return self._modules.get("topic_model")
+
+    @property
+    def pgcl(self):
+        if self.use_dual_branch and self.use_pgcl:
+            return self.fusion_pgcl.pgcl
+        return self._modules.get("pgcl")
+
+    @property
+    def pgcl_classifier(self):
+        if self.use_dual_branch and self.use_pgcl:
+            return self.fusion_pgcl.e_classifier
+        return self._modules.get("pgcl_classifier")
