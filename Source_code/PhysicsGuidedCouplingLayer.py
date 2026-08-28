@@ -1,6 +1,12 @@
 """
 Physics-Guided Coupling Layer (PGCL) for CircS-ViT.
-Fuses ViT/CLS features with sLDA topic proportions under physics-guided gating.
+
+Eqs. (29)--(33) in the manuscript:
+    u = [z; theta] in R^{d+K}
+    f = FusionMLP(u) in R^{d_h}          (LayerNorm / GELU / Dropout)
+    g = sigmoid(MLP_gate(theta)) in R^{d_h}
+    v = f odot g
+    e = EnhanceMLP(v) in R^{d_h}         (LayerNorm / GELU)
 """
 
 import torch
@@ -8,9 +14,9 @@ import torch.nn as nn
 
 
 class PhysicsGuidedCouplingLayer(nn.Module):
-    """Single-branch Physics-Guided Coupling Layer (PGCL)."""
+    """Single-branch PGCL: e = PGCL(z, theta)."""
 
-    def __init__(self, embed_dim=64, num_topics=15, num_classes=9, hidden_dim=128):
+    def __init__(self, embed_dim=64, num_topics=15, num_classes=9, hidden_dim=128, dropout=0.1):
         super(PhysicsGuidedCouplingLayer, self).__init__()
 
         self.embed_dim = embed_dim
@@ -23,24 +29,24 @@ class PhysicsGuidedCouplingLayer(nn.Module):
             nn.Linear(fusion_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1)
+            nn.Dropout(dropout),
         )
 
         self.physics_guidance = nn.Sequential(
             nn.Linear(num_topics, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, hidden_dim),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
         self.feature_enhancement = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.GELU()
+            nn.GELU(),
         )
 
     def forward(self, original_features, topic_representation):
@@ -58,9 +64,11 @@ class PhysicsGuidedCouplingLayer(nn.Module):
 
 class DualBranchFusionPGCL(nn.Module):
     """
-    Dual-branch fusion Physics-Guided Coupling Layer (PGCL).
-    During RSD training, both branches process RSD data and are fused into this module.
-    During Cir-domain training, this layer accepts CLS features and outputs enhanced features.
+    Stage-1 dual-branch wrapper (Algorithm 2).
+
+    Branch 1: linear projection of 12-channel RSD polarimetric features -> z.
+    Branch 2: ViT CLS embedding (passed in as cls_features) -> z.
+    Both branches share one TopMod_RSD and one PGCL_RSD.
     """
 
     def __init__(self, embed_dim=64, num_topics=15, num_classes=9, hidden_dim=128,
@@ -76,64 +84,46 @@ class DualBranchFusionPGCL(nn.Module):
 
         from SupervisedTopicModelForPGCL import SupervisedTopicModelForPGCL
 
+        # Branch 1 encoder: linear projection of x_RSD to z in R^d
         self.branch1_projection = nn.Sequential(
             nn.Flatten(),
             nn.Linear(in_channels * img_size * img_size, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
         )
 
-        self.branch1_topic_model = SupervisedTopicModelForPGCL(
+        # Shared TopMod_RSD and PGCL_RSD
+        self.topic_model = SupervisedTopicModelForPGCL(
             embed_dim=embed_dim,
             num_topics=num_topics,
             num_classes=num_classes,
             feature_depth=mlp_feature_depth,
         )
-
-        self.branch1_pgcl = PhysicsGuidedCouplingLayer(
+        self.pgcl = PhysicsGuidedCouplingLayer(
             embed_dim=embed_dim,
             num_topics=num_topics,
             num_classes=num_classes,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            dropout=dropout,
         )
 
-        self.branch2_topic_model = SupervisedTopicModelForPGCL(
-            embed_dim=embed_dim,
-            num_topics=num_topics,
-            num_classes=num_classes,
-            feature_depth=mlp_feature_depth,
-        )
+        # Optional L_CE^e head on e (Eq. (23)); shared across branches
+        self.e_classifier = nn.Linear(hidden_dim, num_classes)
 
-        self.branch2_pgcl = PhysicsGuidedCouplingLayer(
-            embed_dim=embed_dim,
-            num_topics=num_topics,
-            num_classes=num_classes,
-            hidden_dim=hidden_dim
-        )
-
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU()
-        )
+    def encode(self, z):
+        """Shared TopMod + PGCL path: z -> (theta, hat_z, e)."""
+        theta, hat_z = self.topic_model(z)
+        e = self.pgcl(z, theta)
+        return theta, hat_z, e
 
     def forward(self, cls_features, raw_data=None):
-        if raw_data is not None:
-            branch1_features = self.branch1_projection(raw_data)
-        else:
-            branch1_features = cls_features
+        """
+        If raw_data is given (Stage 1): run both branches through the shared modules.
+        Otherwise (Stage 2 residual / fusion): run only the CLS path.
+        Returns e of the CLS path (and topic proportions for logging).
+        """
+        theta2, _, e2 = self.encode(cls_features)
+        if raw_data is None:
+            return e2, theta2, theta2
 
-        branch1_topic, _ = self.branch1_topic_model(branch1_features)
-        branch1_enhanced = self.branch1_pgcl(branch1_features, branch1_topic)
-
-        branch2_topic, _ = self.branch2_topic_model(cls_features)
-        branch2_enhanced = self.branch2_pgcl(cls_features, branch2_topic)
-
-        fused_features = torch.cat([branch1_enhanced, branch2_enhanced], dim=1)
-        enhanced_features = self.fusion_layer(fused_features)
-        return enhanced_features, branch1_topic, branch2_topic
+        z1 = self.branch1_projection(raw_data)
+        theta1, _, e1 = self.encode(z1)
+        return e2, theta1, theta2, e1, z1
