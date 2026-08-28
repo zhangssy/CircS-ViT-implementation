@@ -1,6 +1,9 @@
 """
-Vision Transformer backbone for circular-polarization (Cir) feature maps.
-PGCL layers from the pre-trained RSD stage can be injected after each encoder block.
+Vision Transformer backbone for 10-channel Cir-domain patches (Stage 2).
+
+Eqs. (34)--(37): PatchEmbed (P=1) -> CLS + positional encoding ->
+L_Cir Transformer blocks, with frozen TopMod/PGCL residual inserts after
+layers 0--3 on the CLS token only, then LayerNorm and h_CLS.
 """
 
 import torch
@@ -13,25 +16,22 @@ class PatchEmbedding(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
-
-        # Patch embedding via 1x1 convolution
         self.proj = nn.Conv2d(
             in_channels,
             embed_dim,
             kernel_size=patch_size,
-            stride=patch_size
+            stride=patch_size,
         )
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        x = self.proj(x)  # (B, embed_dim, H/ps, W/ps)
-        x = x.flatten(2)  # (B, embed_dim, num_patches)
-        x = x.transpose(1, 2)  # (B, num_patches, embed_dim)
+        x = self.proj(x)
+        x = x.flatten(2)
+        x = x.transpose(1, 2)
         return x
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=64, num_heads=4, mlp_dim=108, dropout=0.1):
+    def __init__(self, embed_dim=64, num_heads=4, mlp_dim=128, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
@@ -41,7 +41,7 @@ class TransformerEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, embed_dim),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -51,25 +51,24 @@ class TransformerEncoder(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, img_size=7, patch_size=1, in_channels=10, num_classes=9,
-                 embed_dim=64, depth=4, num_heads=4, mlp_dim=108, dropout=0.1,
-                 num_topics=15, use_pgcl=False, rsd_model_path=None):
-        """
-        Cir-domain Vision Transformer.
+    """
+    ViT_Cir. Residual PGCL uses the SAME frozen TopMod/PGCL as Stage-1
+    (shared modules), applied only to the CLS token after layers 0--3.
+    """
 
-        Args:
-            img_size: spatial size of the input patch
-            in_channels: number of Cir feature channels
-            num_classes: number of land-cover classes
-            embed_dim: token embedding dimension
-            depth: number of transformer encoder blocks
-            rsd_model_path: optional checkpoint from Stage-1 (RSD PGCL) training
-        """
+    residual_insert_layers = (0, 1, 2, 3)
+
+    def __init__(self, img_size=7, patch_size=1, in_channels=10, num_classes=9,
+                 embed_dim=64, depth=4, num_heads=4, mlp_dim=128, dropout=0.1,
+                 num_topics=15, use_pgcl=False, rsd_model_path=None,
+                 frozen_topic=None, frozen_pgcl=None, pgcl_hidden_dim=128):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
         self.use_pgcl = use_pgcl
         self.depth = depth
+        self.img_size = img_size
+        self.pgcl_hidden_dim = pgcl_hidden_dim
 
         self.patch_embed = PatchEmbedding(in_channels, embed_dim, img_size, patch_size)
         num_patches = self.patch_embed.num_patches
@@ -83,140 +82,106 @@ class VisionTransformer(nn.Module):
         ])
         self.norm = nn.LayerNorm(embed_dim)
 
-        # PGCL guidance modules loaded from the RSD checkpoint (one per encoder block)
-        self.rsd_pgcl_layers = nn.ModuleList()
-        if rsd_model_path is not None:
-            self._load_rsd_pgcl_layers(rsd_model_path, embed_dim, num_topics, num_classes)
-
+        self.pgcl_to_token = nn.Linear(pgcl_hidden_dim, embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
 
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.head.weight, std=0.02)
 
-    def _load_rsd_pgcl_layers(self, rsd_model_path, embed_dim, num_topics, num_classes):
-        """Load PGCL guidance weights from the Stage-1 RSD checkpoint."""
-        try:
-            rsd_state_dict = torch.load(rsd_model_path, map_location='cpu')
+        if frozen_topic is not None and frozen_pgcl is not None:
+            object.__setattr__(self, "_frozen_topic", None)
+            object.__setattr__(self, "_frozen_pgcl", None)
+            self.set_frozen_guidance(frozen_topic, frozen_pgcl)
+        elif rsd_model_path is not None:
+            object.__setattr__(self, "_frozen_topic", None)
+            object.__setattr__(self, "_frozen_pgcl", None)
+            self._load_frozen_guidance(rsd_model_path, embed_dim, num_topics, num_classes)
+        else:
+            object.__setattr__(self, "_frozen_topic", None)
+            object.__setattr__(self, "_frozen_pgcl", None)
 
-            from SupervisedTopicModelForPGCL import SupervisedTopicModelForPGCL
-            from PhysicsGuidedCouplingLayer import PhysicsGuidedCouplingLayer
-            from PhysicsGuidedCouplingLayer import DualBranchFusionPGCL
+    def set_frozen_guidance(self, topic_model, pgcl):
+        """Attach shared frozen TopMod/PGCL without registering them as submodules."""
+        for p in topic_model.parameters():
+            p.requires_grad = False
+        for p in pgcl.parameters():
+            p.requires_grad = False
+        topic_model.eval()
+        pgcl.eval()
+        object.__setattr__(self, "_frozen_topic", topic_model)
+        object.__setattr__(self, "_frozen_pgcl", pgcl)
 
-            fusion_pgcl_keys = {k.replace('fusion_pgcl.', ''): v
-                                for k, v in rsd_state_dict.items()
-                                if 'fusion_pgcl' in k}
+    def _load_frozen_guidance(self, rsd_model_path, embed_dim, num_topics, num_classes):
+        from SupervisedTopicModelForPGCL import SupervisedTopicModelForPGCL
+        from PhysicsGuidedCouplingLayer import PhysicsGuidedCouplingLayer
 
-            if fusion_pgcl_keys:
-                fusion_pgcl = DualBranchFusionPGCL(
-                    embed_dim=embed_dim,
-                    num_topics=num_topics,
-                    num_classes=num_classes,
-                    hidden_dim=128,
-                    dropout=0.1,
-                    in_channels=10,  # Cir feature channels (may differ from RSD)
-                    img_size=7
-                )
+        rsd_state_dict = torch.load(rsd_model_path, map_location="cpu")
+        topic_model = SupervisedTopicModelForPGCL(
+            embed_dim=embed_dim,
+            num_topics=num_topics,
+            num_classes=num_classes,
+        )
+        pgcl = PhysicsGuidedCouplingLayer(
+            embed_dim=embed_dim,
+            num_topics=num_topics,
+            num_classes=num_classes,
+            hidden_dim=self.pgcl_hidden_dim,
+        )
 
-                fusion_pgcl_dict = fusion_pgcl.state_dict()
-                filtered_fusion_keys = {}
-                skipped_keys = []
+        topic_keys = {}
+        pgcl_keys = {}
+        for k, v in rsd_state_dict.items():
+            if k.startswith("fusion_pgcl.topic_model."):
+                topic_keys[k.replace("fusion_pgcl.topic_model.", "", 1)] = v
+            elif k.startswith("fusion_pgcl.pgcl."):
+                pgcl_keys[k.replace("fusion_pgcl.pgcl.", "", 1)] = v
+            elif k.startswith("fusion_pgcl.branch2_topic_model."):
+                topic_keys[k.replace("fusion_pgcl.branch2_topic_model.", "", 1)] = v
+            elif k.startswith("fusion_pgcl.branch2_pgcl."):
+                pgcl_keys[k.replace("fusion_pgcl.branch2_pgcl.", "", 1)] = v
 
-                for k, v in fusion_pgcl_keys.items():
-                    if k in fusion_pgcl_dict:
-                        if fusion_pgcl_dict[k].shape == v.shape:
-                            filtered_fusion_keys[k] = v
-                        else:
-                            skipped_keys.append(
-                                f"{k}: checkpoint shape {v.shape} != model shape {fusion_pgcl_dict[k].shape}"
-                            )
-                    else:
-                        skipped_keys.append(f"{k}: key not in model")
+        if topic_keys:
+            topic_model.load_state_dict(topic_keys, strict=False)
+        if pgcl_keys:
+            pgcl.load_state_dict(pgcl_keys, strict=False)
+        print(f"Loaded frozen TopMod/PGCL from {rsd_model_path}")
+        self.set_frozen_guidance(topic_model, pgcl)
 
-                if skipped_keys:
-                    print("  Warning: skipped mismatched PGCL keys (first 5 shown):")
-                    for key in skipped_keys[:5]:
-                        print(f"    - {key}")
-                    if len(skipped_keys) > 5:
-                        print(f"    ... and {len(skipped_keys) - 5} more")
-                    print("  Note: branch1_projection may differ between RSD and Cir channels.")
+    @property
+    def frozen_topic(self):
+        return self._frozen_topic
 
-                fusion_pgcl.load_state_dict(filtered_fusion_keys, strict=False)
-                print("  Loaded dual-branch fusion PGCL weights.")
+    @property
+    def frozen_pgcl(self):
+        return self._frozen_pgcl
 
-                for _ in [0, 1, 2, 3]:
-                    projection = nn.Linear(128, embed_dim)
-                    pgcl_module = nn.ModuleDict({
-                        'fusion_pgcl': fusion_pgcl,
-                        'projection': projection
-                    })
-                    self.rsd_pgcl_layers.append(pgcl_module)
-            else:
-                print("  Fusion PGCL not found; falling back to single-branch PGCL.")
-                for _ in [0, 1, 2, 3]:
-                    topic_model = SupervisedTopicModelForPGCL(
-                        embed_dim=embed_dim,
-                        num_topics=num_topics,
-                        num_classes=num_classes
-                    )
-                    pgcl = PhysicsGuidedCouplingLayer(
-                        embed_dim=embed_dim,
-                        num_topics=num_topics,
-                        num_classes=num_classes,
-                        hidden_dim=128
-                    )
-                    projection = nn.Linear(128, embed_dim)
+    def train(self, mode=True):
+        super().train(mode)
+        if self._frozen_topic is not None:
+            self._frozen_topic.eval()
+        if self._frozen_pgcl is not None:
+            self._frozen_pgcl.eval()
+        return self
 
-                    topic_model_keys = {k.replace('topic_model.', ''): v
-                                       for k, v in rsd_state_dict.items()
-                                       if 'topic_model' in k and 'fusion_pgcl' not in k}
-                    pgcl_keys = {k.replace('pgcl.', ''): v
-                                 for k, v in rsd_state_dict.items()
-                                 if 'pgcl' in k and 'fusion_pgcl' not in k}
+    def _apply(self, fn):
+        super()._apply(fn)
+        if getattr(self, "_frozen_topic", None) is not None:
+            self._frozen_topic._apply(fn)
+        if getattr(self, "_frozen_pgcl", None) is not None:
+            self._frozen_pgcl._apply(fn)
+        return self
 
-                    if topic_model_keys:
-                        topic_model.load_state_dict(topic_model_keys, strict=False)
-                    if pgcl_keys:
-                        pgcl.load_state_dict(pgcl_keys, strict=False)
-
-                    pgcl_module = nn.ModuleDict({
-                        'topic_model': topic_model,
-                        'pgcl': pgcl,
-                        'projection': projection
-                    })
-                    self.rsd_pgcl_layers.append(pgcl_module)
-
-            print(f"Successfully loaded RSD PGCL layers from {rsd_model_path}")
-        except Exception as e:
-            print(f"Warning: Failed to load RSD PGCL layers: {e}")
-            print("Creating new PGCL layers instead...")
-            from SupervisedTopicModelForPGCL import SupervisedTopicModelForPGCL
-            from PhysicsGuidedCouplingLayer import PhysicsGuidedCouplingLayer
-
-            for _ in [0, 1, 2, 3]:
-                topic_model = SupervisedTopicModelForPGCL(
-                    embed_dim=embed_dim,
-                    num_topics=num_topics,
-                    num_classes=num_classes
-                )
-                pgcl = PhysicsGuidedCouplingLayer(
-                    embed_dim=embed_dim,
-                    num_topics=num_topics,
-                    num_classes=num_classes,
-                    hidden_dim=128
-                )
-                projection = nn.Linear(128, embed_dim)
-                pgcl_module = nn.ModuleDict({
-                    'topic_model': topic_model,
-                    'pgcl': pgcl,
-                    'projection': projection
-                })
-                self.rsd_pgcl_layers.append(pgcl_module)
+    def _residual_pgcl_on_cls(self, current_cls):
+        """Same frozen TopMod -> PGCL path, then project e back to d."""
+        with torch.no_grad():
+            theta, _ = self._frozen_topic(current_cls)
+            enhanced = self._frozen_pgcl(current_cls, theta)
+        return current_cls + self.pgcl_to_token(enhanced)
 
     def forward(self, x):
         B = x.size(0)
         x = self.patch_embed(x)
-
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
@@ -224,24 +189,13 @@ class VisionTransformer(nn.Module):
 
         for i, blk in enumerate(self.blocks):
             x = blk(x)
-
-            if i in [0, 1, 2, 3] and len(self.rsd_pgcl_layers) > 0:
-                current_cls = x[:, 0]
-                pgcl_idx = i
-                if pgcl_idx < len(self.rsd_pgcl_layers):
-                    rsd_module = self.rsd_pgcl_layers[pgcl_idx]
-
-                    if 'fusion_pgcl' in rsd_module:
-                        enhanced_features, _, _ = rsd_module['fusion_pgcl'](
-                            current_cls, raw_data=None  # Cir stage uses CLS features only
-                        )
-                    else:
-                        topic_representation, _ = rsd_module['topic_model'](current_cls)
-                        enhanced_features = rsd_module['pgcl'](current_cls, topic_representation)
-
-                    projected_features = rsd_module['projection'](enhanced_features)
-                    updated_cls = current_cls + projected_features
-                    x = torch.cat([updated_cls.unsqueeze(1), x[:, 1:]], dim=1)
+            if (
+                i in self.residual_insert_layers
+                and self._frozen_topic is not None
+                and self._frozen_pgcl is not None
+            ):
+                updated_cls = self._residual_pgcl_on_cls(x[:, 0])
+                x = torch.cat([updated_cls.unsqueeze(1), x[:, 1:]], dim=1)
 
         x = self.norm(x)
         cls_out = x[:, 0]
@@ -249,25 +203,13 @@ class VisionTransformer(nn.Module):
         return out, cls_out
 
     def extract_features(self, x):
-        """Return CLS token features for downstream analysis."""
         B = x.size(0)
         x = self.patch_embed(x)
-
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-
         for blk in self.blocks:
             x = blk(x)
-
         x = self.norm(x)
         return x[:, 0]
-
-    def get_topic_representation(self, x):
-        """Return topic proportions when PGCL is enabled."""
-        if not self.use_pgcl:
-            raise ValueError("PGCL is disabled; topic representation is unavailable.")
-
-        cls_features = self.extract_features(x)
-        return self.topic_model.get_topic_representation(cls_features)
