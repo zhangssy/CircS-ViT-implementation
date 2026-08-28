@@ -27,25 +27,32 @@ import numpy as np
 from VisionTransformer_RSD import VisionTransformer as ViT_RSD
 from VisionTransformer_Cir import VisionTransformer as ViT_Cir
 
-# CircS-ViT hyper-parameters (Table V & Section IV-E of the paper)
+# CircS-ViT hyper-parameters (Tables III--VII and Eqs. (23)--(24), (26)--(27))
 PAPER_DEFAULTS = {
-    "num_topics": 15,
-    "embed_dim": 64,
-    "num_heads": 4,
-    "rsd_depth": 3,
-    "cir_depth": 4,
-    "mlp_feature_depth": 4,
-    "topic_lambda": 0.1,
-    "kd_lambda": 0.2,
+    "num_topics": 15,            # K
+    "embed_dim": 64,             # d
+    "num_heads": 4,              # h
+    "rsd_depth": 3,              # L_RSD
+    "cir_depth": 4,              # L_Cir
+    "mlp_feature_depth": 4,      # D of MLP_f2t
+    "topic_lambda": 0.1,         # lambda_rec
+    "kd_lambda": 0.2,            # lambda_KD
+    "lambda_ce_e": 1.0,          # lambda_CE^e (optional Stage-1 CE on PGCL features)
     "batch_size": 32,
     "epochs": 120,
     "lr": 4e-4,
     "weight_decay": 0.0005,
-    "patch_size": 7,
-    "token_patch_size": 1,
+    "token_patch_size": 1,       # P
     "dropout": 0.1,
     "pgcl_hidden_dim": 128,
     "fusion_dim": 128,
+}
+
+# Scene-dependent window H_w x W_w and class count N_c (Table VII / Dataset Description)
+SCENE_SETTINGS = {
+    "barnaul": {"patch_size": 7, "num_classes": 9},
+    "san_francisco": {"patch_size": 11, "num_classes": 5},
+    "oberpfaffenhofen": {"patch_size": 11, "num_classes": 7},
 }
 
 
@@ -115,14 +122,20 @@ def train_rsd_with_pgcl(config):
 
     print(
         f"Detected in_channels={actual_in_channels} "
-        f"(config rsd_in_channels={config.get('rsd_in_channels', 'N/A')})",
+        f"(paper RSD channels={config.get('rsd_in_channels', 12)})",
         flush=True,
     )
+    if actual_in_channels != config.get("rsd_in_channels", 12):
+        print(
+            "Warning: Stage 1 expects 12-channel circular-basis RSD polarimetric features.",
+            flush=True,
+        )
 
     use_dual_branch = config.get("use_dual_branch", True)
 
     model = ViT_RSD(
-        img_size=config.get("patch_size", PAPER_DEFAULTS["patch_size"]),
+        img_size=config.get("patch_size", SCENE_SETTINGS["barnaul"]["patch_size"]),
+        patch_size=PAPER_DEFAULTS["token_patch_size"],
         embed_dim=PAPER_DEFAULTS["embed_dim"],
         num_heads=PAPER_DEFAULTS["num_heads"],
         num_classes=config["num_classes"],
@@ -132,6 +145,8 @@ def train_rsd_with_pgcl(config):
         in_channels=actual_in_channels,
         use_dual_branch=use_dual_branch,
         mlp_feature_depth=config.get("mlp_feature_depth", PAPER_DEFAULTS["mlp_feature_depth"]),
+        mlp_dim=PAPER_DEFAULTS["pgcl_hidden_dim"],
+        dropout=PAPER_DEFAULTS["dropout"],
     ).to(device)
 
     if use_dual_branch:
@@ -181,19 +196,28 @@ def train_rsd_with_pgcl(config):
             logits, cls_features, _ = model(batch_tensor)
             cls_loss = calc_loss(logits, labels, device)
 
-            if hasattr(model, 'use_dual_branch') and model.use_dual_branch:
-                branch1_features = model.fusion_pgcl.branch1_projection(batch_tensor)
-                branch1_topic_loss = model.fusion_pgcl.branch1_topic_model.compute_supervised_loss(
-                    branch1_features, labels
-                )
-                branch2_topic_loss = model.fusion_pgcl.branch2_topic_model.compute_supervised_loss(
-                    cls_features, labels
-                )
-                topic_loss = branch1_topic_loss + branch2_topic_loss
-            else:
-                topic_loss = model.topic_model.compute_supervised_loss(cls_features, labels)
+            lambda_rec = config["topic_lambda"]
+            lambda_ce_e = config.get("lambda_ce_e", 1.0)
+            topic_model = model.topic_model
+            pgcl = model.pgcl
 
-            total_loss_batch = cls_loss + config["topic_lambda"] * topic_loss
+            if model.use_dual_branch:
+                # Algorithm 2: both branches share TopMod/PGCL; accumulate L_S1
+                z2 = cls_features
+                z1 = model.fusion_pgcl.branch1_projection(batch_tensor)
+                topic_loss_1 = topic_model.compute_supervised_loss(z1, labels, lambda_rec=lambda_rec)
+                topic_loss_2 = topic_model.compute_supervised_loss(z2, labels, lambda_rec=lambda_rec)
+                theta1, _ = topic_model(z1)
+                e1 = pgcl(z1, theta1)
+                ce_e1 = calc_loss(model.pgcl_classifier(e1), labels, device)
+                ce_e2 = cls_loss
+                topic_loss = topic_loss_1 + topic_loss_2
+                total_loss_batch = topic_loss + lambda_ce_e * (ce_e1 + ce_e2)
+            else:
+                topic_loss = topic_model.compute_supervised_loss(
+                    cls_features, labels, lambda_rec=lambda_rec
+                )
+                total_loss_batch = topic_loss + lambda_ce_e * cls_loss
             total_loss_batch.backward()
             optimizer.step()
 
@@ -235,25 +259,13 @@ def train_rsd_with_pgcl(config):
     model.load_state_dict(torch.load(best_path, map_location=device))
     print(f"Stage-1 done. Best acc={best_acc:.2f}% checkpoint={best_path}", flush=True)
 
-    if hasattr(model, 'use_dual_branch') and model.use_dual_branch:
-        guidance_fusion_pgcl = copy.deepcopy(model.fusion_pgcl).eval()
-        for p in guidance_fusion_pgcl.parameters():
-            p.requires_grad = False
-        guidance_topic = copy.deepcopy(model.fusion_pgcl.branch2_topic_model).eval()
-        guidance_pgcl = copy.deepcopy(model.fusion_pgcl.branch2_pgcl).eval()
-        for p in guidance_topic.parameters():
-            p.requires_grad = False
-        for p in guidance_pgcl.parameters():
-            p.requires_grad = False
-        return guidance_topic, guidance_pgcl, best_path, guidance_fusion_pgcl
-
     guidance_topic = copy.deepcopy(model.topic_model).eval()
     guidance_pgcl = copy.deepcopy(model.pgcl).eval()
     for p in guidance_topic.parameters():
         p.requires_grad = False
     for p in guidance_pgcl.parameters():
         p.requires_grad = False
-    return guidance_topic, guidance_pgcl, best_path, None
+    return guidance_topic, guidance_pgcl, best_path
 
 
 def evaluate(model, data_loader, device, use_pgcl, in_channels=None):
@@ -281,33 +293,35 @@ def evaluate(model, data_loader, device, use_pgcl, in_channels=None):
 
 class GuidedVisionTransformerCir(nn.Module):
     """
-    Cir-domain fusion model: ViT_Cir backbone + frozen PGCL guidance + fusion head.
+    Stage-2 fusion model (Algorithm 3):
+        h_CLS <- ViT_Cir(x_r)
+        theta <- frozen TopMod(h_CLS)
+        e     <- frozen PGCL(h_CLS, theta)
+        o_fusion <- FusionHead([h_CLS; e])
+    Only ViT_Cir (except frozen TopMod/PGCL) and FusionHead are updated.
     """
 
     def __init__(self, base_model, guidance_topic, guidance_pgcl, num_classes,
                  fusion_dim=PAPER_DEFAULTS["fusion_dim"]):
         super().__init__()
         self.backbone = base_model
-        self.guidance_topic = guidance_topic
-        self.guidance_pgcl = guidance_pgcl
         self.num_classes = num_classes
+        self.backbone.set_frozen_guidance(guidance_topic, guidance_pgcl)
 
         hidden_dim = fusion_dim
         self.fusion_head = nn.Sequential(
             nn.Linear(self.backbone.embed_dim + hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_classes)
+            nn.Dropout(PAPER_DEFAULTS["dropout"]),
+            nn.Linear(hidden_dim, num_classes),
         )
 
     def forward(self, x):
         logits_base, cls_features = self.backbone(x)
-
         with torch.no_grad():
-            topic_representation, _ = self.guidance_topic(cls_features)
-            guided_features = self.guidance_pgcl(cls_features, topic_representation)
-
+            topic_representation, _ = self.backbone.frozen_topic(cls_features)
+            guided_features = self.backbone.frozen_pgcl(cls_features, topic_representation)
         fused_feature = torch.cat([cls_features, guided_features], dim=1)
         fusion_logits = self.fusion_head(fused_feature)
         return fusion_logits, logits_base
@@ -318,14 +332,20 @@ def train_cir_with_guidance(config, guidance_topic, guidance_pgcl, rsd_model_pat
     device = config["device"]
 
     base_model = ViT_Cir(
-        img_size=config.get("patch_size", PAPER_DEFAULTS["patch_size"]),
+        img_size=config.get("patch_size", SCENE_SETTINGS["barnaul"]["patch_size"]),
+        patch_size=PAPER_DEFAULTS["token_patch_size"],
+        in_channels=config.get("cir_in_channels", 10),
         embed_dim=PAPER_DEFAULTS["embed_dim"],
         num_heads=PAPER_DEFAULTS["num_heads"],
         num_classes=config["num_classes"],
         num_topics=config["num_topics"],
         use_pgcl=False,
         depth=config.get("cir_depth", PAPER_DEFAULTS["cir_depth"]),
-        rsd_model_path=rsd_model_path,
+        mlp_dim=PAPER_DEFAULTS["pgcl_hidden_dim"],
+        dropout=PAPER_DEFAULTS["dropout"],
+        frozen_topic=guidance_topic,
+        frozen_pgcl=guidance_pgcl,
+        pgcl_hidden_dim=PAPER_DEFAULTS["pgcl_hidden_dim"],
     ).to(device)
 
     guided_model = GuidedVisionTransformerCir(
@@ -336,7 +356,7 @@ def train_cir_with_guidance(config, guidance_topic, guidance_pgcl, rsd_model_pat
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        guided_model.parameters(),
+        filter(lambda p: p.requires_grad, guided_model.parameters()),
         lr=config["lr"],
         weight_decay=config.get("weight_decay", PAPER_DEFAULTS["weight_decay"]),
     )
@@ -438,13 +458,24 @@ def evaluate_fusion(model, data_loader, device, in_channels):
 
 if __name__ == "__main__":
     # -----------------------------------------------------------------------
-    # User-configurable paths (modify before running)
+    # User-configurable paths and scene (modify before running)
+    # SCENE: "barnaul" | "san_francisco" | "oberpfaffenhofen"
+    #   Barnaul: 7x7 window, 9 classes
+    #   San Francisco / Oberpfaffenhofen: 11x11 window, 5 / 7 classes
     # -----------------------------------------------------------------------
     DATA_ROOT = "./data"
     CHECKPOINT_DIR = "./checkpoints"
+    SCENE = "barnaul"
+
+    if SCENE not in SCENE_SETTINGS:
+        raise ValueError(f"Unknown SCENE={SCENE!r}; choose one of {list(SCENE_SETTINGS)}")
+    scene_cfg = SCENE_SETTINGS[SCENE]
+    patch_size = scene_cfg["patch_size"]
+    num_classes = scene_cfg["num_classes"]
 
     print("=" * 60, flush=True)
     print("Train_Fusion starting...", flush=True)
+    print(f"Scene: {SCENE} (window={patch_size}x{patch_size}, N_c={num_classes})", flush=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
     if device.type == "cuda":
@@ -458,13 +489,14 @@ if __name__ == "__main__":
         "epochs": PAPER_DEFAULTS["epochs"],
         "lr": PAPER_DEFAULTS["lr"],
         "weight_decay": PAPER_DEFAULTS["weight_decay"],
-        "num_classes": 9,
+        "num_classes": num_classes,
         "num_topics": PAPER_DEFAULTS["num_topics"],
         "rsd_depth": PAPER_DEFAULTS["rsd_depth"],
         "mlp_feature_depth": PAPER_DEFAULTS["mlp_feature_depth"],
         "topic_lambda": PAPER_DEFAULTS["topic_lambda"],
+        "lambda_ce_e": PAPER_DEFAULTS["lambda_ce_e"],
         "rsd_in_channels": 12,
-        "patch_size": PAPER_DEFAULTS["patch_size"],
+        "patch_size": patch_size,
         "save_dir": CHECKPOINT_DIR,
     }
 
@@ -476,19 +508,16 @@ if __name__ == "__main__":
         "epochs": PAPER_DEFAULTS["epochs"],
         "lr": PAPER_DEFAULTS["lr"],
         "weight_decay": PAPER_DEFAULTS["weight_decay"],
-        "num_classes": 9,
+        "num_classes": num_classes,
         "num_topics": PAPER_DEFAULTS["num_topics"],
         "kd_lambda": PAPER_DEFAULTS["kd_lambda"],
         "cir_depth": PAPER_DEFAULTS["cir_depth"],
         "cir_in_channels": 10,
-        "patch_size": PAPER_DEFAULTS["patch_size"],
+        "patch_size": patch_size,
         "save_dir": CHECKPOINT_DIR,
     }
 
     result = train_rsd_with_pgcl(rsd_config)
-    if len(result) == 4:
-        guidance_topic, guidance_pgcl, rsd_best_path, _ = result
-    else:
-        guidance_topic, guidance_pgcl, rsd_best_path = result
+    guidance_topic, guidance_pgcl, rsd_best_path = result
 
     train_cir_with_guidance(cir_config, guidance_topic, guidance_pgcl, rsd_best_path)
