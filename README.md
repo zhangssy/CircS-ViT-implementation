@@ -19,7 +19,6 @@ To quantitatively measure the proposed method, several evaluation metrics are em
 
 # Citation
 
-@article{ title={Topic- and Physics-guided Vision Transformer for PolSAR Land Cover Classification via Circular Polarization Features}, author={Shuaiying Zhang, Zhen Dong, Linjie Cai, Zhendong Zhang, Tong Li, Jinran Wu, Yayong Li, Jianqing Du,
-Shangce Gao, Wentao An, and Yanfen Wang}, journal={IEEE/CAA Journal of Automatica Sinica}, volume={}, pages={}, year={2026}, publisher={IEEE} }
+@article{ title={Topic- and Physics-guided Vision Transformer for PolSAR Land Cover Classification via Circular Polarization Features}, author={****}, journal={IEEE/CAA Journal of Automatica Sinica}, volume={}, pages={}, year={2026}, publisher={IEEE} }
 
-Feel free to contact me : zhangshuaiying@nudt.edu.cn
+Feel free to contact me : ****
